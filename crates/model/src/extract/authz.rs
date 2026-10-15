@@ -34,7 +34,7 @@ static ADMIN_MW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)admin|super
 static GUARD_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)authori[sz]|assert|ensure|check|verify|permit|guard|can[A-Z]|require|own").expect("static regex"));
 
-struct Env<'x> {
+struct Env {
     principal_paths: BTreeSet<String>,
     /// Request ids used as lookup keys (for tenant scoping).
     lookup_ids: BTreeSet<String>,
@@ -45,7 +45,7 @@ struct Env<'x> {
     request_params: BTreeSet<String>,
     resource: BTreeSet<String>,
     ownership: BTreeSet<String>,
-    admin_roles: &'x [String],
+    admin_roles: Vec<String>,
     guard_fns: BTreeSet<String>,
     vars: BTreeMap<String, ModelVar>,
     role_members: Vec<String>,
@@ -53,7 +53,7 @@ struct Env<'x> {
     uses_role: bool,
 }
 
-impl Env<'_> {
+impl Env {
     fn gate(&mut self, text: &str) -> Expr {
         let t: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect();
         let n = self.gates.len() + 1;
@@ -310,10 +310,60 @@ fn middleware_guard(ctx: &ExtractContext<'_>, route_module: &ModuleFacts, mw: &s
     }
 }
 
+/// The exact roles a middleware admits (read from its code), when every
+/// definition it could resolve to agrees; `None` when unknown.
+fn middleware_admits(ctx: &ExtractContext<'_>, route_module: &ModuleFacts, mw: &str) -> Option<Vec<String>> {
+    let (callee, call_args) = match mw.split_once('(') {
+        Some((c, rest)) => (c, Some(rest.trim_end().strip_suffix(')')?)),
+        None => (mw, None),
+    };
+    let name = callee.trim().rsplit('.').next().unwrap_or(callee).trim();
+    let candidates: Vec<(&ModuleFacts, Option<Vec<String>>)> = ctx
+        .facts
+        .modules
+        .iter()
+        .flat_map(|mm| {
+            mm.functions
+                .iter()
+                .filter(move |f| f.guard.is_some() && (f.name == name || f.name.rsplit('.').next() == Some(name)))
+                .map(move |f| (mm, f.admits_roles.clone()))
+        })
+        .collect();
+    let near: Vec<&Option<Vec<String>>> =
+        candidates.iter().filter(|(mm, _)| mm.file == route_module.file || route_module.imports.contains(&mm.file)).map(|(_, r)| r).collect();
+    let pick: Vec<&Option<Vec<String>>> = if near.is_empty() { candidates.iter().map(|(_, r)| r).collect() } else { near };
+    let admits = match pick.as_slice() {
+        [first, rest @ ..] if rest.iter().all(|r| r == first) => (*first).clone()?,
+        _ => return None,
+    };
+    // Placeholders for a factory's parameters: the roles are the literals at the call
+    // (`requireRole('admin', 'super_admin')`, `requireRole(['admin'])`); anything that
+    // is not a plain string literal (a variable, a spread) leaves the set unknown.
+    let literals = |s: &str| -> Option<Vec<String>> {
+        let v: Option<Vec<String>> = s
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(|x| {
+                let q = x.chars().next()?;
+                (matches!(q, '\'' | '"') && x.len() >= 2 && x.ends_with(q) && !x[1..x.len() - 1].contains(['\'', '"', '\\']))
+                    .then(|| x[1..x.len() - 1].to_owned())
+            })
+            .collect();
+        v.filter(|v| !v.is_empty())
+    };
+    match (admits.as_slice(), call_args) {
+        ([p], Some(args)) if p == "$args" => literals(args),
+        ([p], Some(args)) if p == "$arg0" => literals(args.trim().strip_prefix('[')?.strip_suffix(']')?),
+        (roles, _) if roles.iter().any(|r| r.starts_with('$')) => None,
+        _ => Some(admits),
+    }
+}
+
 /// Hypotheses and notes contributed by middleware: from what the code does,
 /// falling back to an opaque gate (never a proof) when the code is not visible.
 /// Returns (facts read from code, assumptions with their labels, notes).
-fn middleware_hyps(env: &mut Env<'_>, ctx: &ExtractContext<'_>, m: &ModuleFacts, mws: &[String]) -> (Vec<Expr>, Vec<(Expr, String)>, Vec<String>) {
+fn middleware_hyps(env: &mut Env, ctx: &ExtractContext<'_>, m: &ModuleFacts, mws: &[String]) -> (Vec<Expr>, Vec<(Expr, String)>, Vec<String>) {
     let (mut hyps, mut assumed, mut notes) = (Vec::new(), Vec::new(), Vec::new());
     for mw in mws.iter().filter(|mw| !INFRA_MW.is_match(mw)) {
         let named_admin = ADMIN_MW.is_match(mw);
@@ -324,17 +374,36 @@ fn middleware_hyps(env: &mut Env<'_>, ctx: &ExtractContext<'_>, m: &ModuleFacts,
         match middleware_guard(ctx, m, mw) {
             Mw::Seen(g) if !g.can_deny => notes.push(format!("Middleware `{mw}` never denies a request (its code always continues): it enforces nothing.")),
             Mw::Seen(g) if named_admin && g.checks_role => {
-                // Evidence that the admin role is what is required: an admin role literal in
-                // the guard's body or in its arguments (`requireRole('admin')`).
-                let named_in_call = env.admin_roles.iter().any(|r| mw.contains(&format!("'{r}'")) || mw.contains(&format!("\"{r}\"")));
+                // Code evidence only when the exact set of roles the guard lets through
+                // was read from its code and every one of them is a trusted admin role.
+                // Naming an admin role somewhere in the body is not enough: a guard that
+                // admits ['admin', 'user'] names 'admin' too.
                 let a = env.is_admin();
-                if g.names_admin || named_in_call {
-                    hyps.push(a);
-                    notes.push(format!("Middleware `{mw}` reads the role, names an admin role and can deny."));
-                } else {
-                    let note = format!("Middleware `{mw}` reads a role and can deny; that it requires role ∈ {{{}}} is assumed.", env.admin_roles.join(", "));
-                    assumed.push((a, note.clone()));
-                    notes.push(note);
+                match middleware_admits(ctx, m, mw) {
+                    Some(roles) if !roles.is_empty() && roles.iter().all(|r| env.admin_roles.contains(r)) => {
+                        hyps.push(a);
+                        notes.push(format!(
+                            "Middleware `{mw}` denies unless role ∈ {{{}}} (read from its code), all of them admin roles ({}).",
+                            roles.join(", "),
+                            env.admin_roles.join(", ")
+                        ));
+                    }
+                    Some(roles) => {
+                        let others: Vec<&String> = roles.iter().filter(|r| !env.admin_roles.contains(r)).collect();
+                        notes.push(format!(
+                            "Middleware `{mw}` lets through role(s) that are not admin roles: {} (admin roles: {}). It is not an admin check.",
+                            others.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(", "),
+                            env.admin_roles.join(", ")
+                        ));
+                    }
+                    None => {
+                        let note = format!(
+                            "Middleware `{mw}` reads a role and can deny, but which roles it lets through could not be read from its code; that it requires role ∈ {{{}}} is assumed.",
+                            env.admin_roles.join(", ")
+                        );
+                        assumed.push((a, note.clone()));
+                        notes.push(note);
+                    }
                 }
             }
             Mw::Seen(_) if named_admin => {
@@ -369,7 +438,7 @@ fn with_assumptions(code: Hypothesis, assumed: &[(Expr, String)]) -> Vec<Hypothe
     v
 }
 
-fn setup<'x>(h: &HandlerFact, ctx: &'x ExtractContext<'_>) -> Env<'x> {
+fn setup(h: &HandlerFact, ctx: &ExtractContext<'_>) -> Env {
     let a = &ctx.config.authorization;
     let p0 = h.params.first().map_or("req", |p| p.name.as_str()).to_owned();
     let mut principal_paths = BTreeSet::new();
@@ -426,7 +495,7 @@ fn setup<'x>(h: &HandlerFact, ctx: &'x ExtractContext<'_>) -> Env<'x> {
         request_params,
         resource: BTreeSet::new(),
         ownership: a.ownership_fields.iter().map(|f| f.to_ascii_lowercase()).collect(),
-        admin_roles: &a.admin_roles,
+        admin_roles: proof_it_core::config::effective_admin_roles(ctx.config, ctx.org).0,
         guard_fns: a.guard_functions.iter().cloned().collect(),
         vars: BTreeMap::new(),
         role_members: vec![],
@@ -441,7 +510,7 @@ struct SinkPath {
     steps: Vec<(Option<Expr>, String, SourceLocation)>,
 }
 
-fn paths_for(env: &mut Env<'_>, sinks: &[&SinkFact]) -> Vec<SinkPath> {
+fn paths_for(env: &mut Env, sinks: &[&SinkFact]) -> Vec<SinkPath> {
     sinks
         .iter()
         .map(|s| {
@@ -468,7 +537,7 @@ fn paths_for(env: &mut Env<'_>, sinks: &[&SinkFact]) -> Vec<SinkPath> {
         .collect()
 }
 
-fn finish(env: &Env<'_>, with_identity: bool) -> (Vec<ModelVar>, Vec<EnumDecl>) {
+fn finish(env: &Env, with_identity: bool) -> (Vec<ModelVar>, Vec<EnumDecl>) {
     let mut vars = Vec::new();
     if with_identity {
         vars.push(ModelVar::new("principal", Sort::Nat, "id of the authenticated principal"));

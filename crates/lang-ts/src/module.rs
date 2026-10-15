@@ -85,6 +85,14 @@ pub fn param_names(p: &FormalParameters<'_>) -> Vec<String> {
     p.items.iter().map(|i| i.pattern.get_identifier_name().map_or_else(|| "_".to_owned(), |n| n.as_str().to_owned())).collect()
 }
 
+/// Parameters of a function that returns middleware: the first named one and the
+/// rest parameter, the only two whose call-site arguments `admitted_roles` maps.
+#[derive(Debug, Clone, Default)]
+struct FactoryParams {
+    first: Option<String>,
+    rest: Option<String>,
+}
+
 /// A `use(...)` call: (prefix, middleware, mounted (import binding, source text), location).
 type RawMount = (String, Vec<String>, Option<(String, String)>, proof_it_core::types::SourceLocation);
 
@@ -128,6 +136,9 @@ struct Pass1 {
     import_bindings: HashMap<String, String>,
     /// (prefix, middleware, mounted identifier or None for module-wide use, location)
     mounts: Vec<RawMount>,
+    /// Functions returned by a factory (`const f = (...roles) => (req, res, next) => …`):
+    /// span start of the returned function → the factory's parameters.
+    factory_params: HashMap<u32, FactoryParams>,
     class_stack: Vec<(String, String, Vec<String>)>, // (name, controller prefix, guards)
 }
 
@@ -217,6 +228,25 @@ impl<'a> Visit<'a> for P1<'_, '_> {
             }
             match i {
                 Expression::ArrowFunctionExpression(a) => {
+                    let fp = FactoryParams {
+                        first: a.params.items.first().and_then(|i| i.pattern.get_identifier_name()).map(|n| n.as_str().to_owned()),
+                        rest: a.params.rest.as_ref().and_then(|r| r.rest.argument.get_identifier_name()).map(|n| n.as_str().to_owned()),
+                    };
+                    let returned: Vec<u32> = match &a.body {
+                        ArrowFunctionBody::FunctionBody(b) => b
+                            .statements
+                            .iter()
+                            .filter_map(|st| match st {
+                                Statement::ReturnStatement(r) => r.argument.as_ref(),
+                                _ => None,
+                            })
+                            .filter_map(fn_span_start)
+                            .collect(),
+                        body => body.as_expression().and_then(fn_span_start).into_iter().collect(),
+                    };
+                    for start in returned {
+                        self.st.factory_params.insert(start, fp.clone());
+                    }
                     // `const show = () => (req, res) => …` / `() => { return (req, res) => … }`
                     match &a.body {
                         ArrowFunctionBody::FunctionBody(b) => self.name_returned(&b.statements, &name),
@@ -779,6 +809,222 @@ fn guard_fact(f: &FnRef<'_, '_>, params: &[String], src: &Source<'_>) -> Option<
     Some(v.g)
 }
 
+/// Span start of a function expression (arrow or `function`), if `e` is one.
+fn fn_span_start(e: &Expression<'_>) -> Option<u32> {
+    match inner(e) {
+        Expression::ArrowFunctionExpression(f) => Some(f.span.start),
+        Expression::FunctionExpression(f) => Some(f.span.start),
+        _ => None,
+    }
+}
+
+/// `const NAME = ['a', 'b'] [as const]` at module level: name → strings.
+/// Only top-level `const`s, so a binding cannot be shadowed or reassigned.
+fn top_level_string_arrays(body: &[Statement<'_>]) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for s in body {
+        let decl = match s {
+            Statement::VariableDeclaration(d) => d,
+            // `export const NAME = [...]`
+            Statement::ExportDeclaration(e) => match &e.declaration {
+                Declaration::VariableDeclaration(d) => d,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if decl.kind != VariableDeclarationKind::Const {
+            continue;
+        }
+        for d in &decl.declarations {
+            if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init)
+                && let Some(v) = string_array(init, &HashMap::new())
+            {
+                out.insert(id.name.as_str().to_owned(), v);
+            }
+        }
+    }
+    out
+}
+
+/// An array of string literals, written inline or as a top-level constant.
+fn string_array(e: &Expression<'_>, consts: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    match inner(e) {
+        Expression::ArrayExpression(a) => {
+            a.elements.iter().map(|el| el.as_expression().and_then(|x| lit_str(x)).map(str::to_owned)).collect::<Option<Vec<_>>>().filter(|v| !v.is_empty())
+        }
+        Expression::Identifier(id) => consts.get(id.name.as_str()).cloned(),
+        _ => None,
+    }
+}
+
+/// The exact set of roles a middleware lets through, or `None` when it cannot
+/// be read with certainty. Recognised, as top-level statements that run before
+/// anything calls `next`:
+///
+///   if (!ROLES.includes(req.….role)) <deny>      → ROLES
+///   if (req.….role !== 'a' [&& … !== 'b']) <deny> → {a, b}
+///
+/// `<deny>` must end in `return` or `throw`, must not call `next()` without an
+/// error, and must contain a denial (status >= 400, throw, `next(err)`). Several
+/// such checks intersect. Anything else (a check inside a branch, after `next`,
+/// a role read through a variable, `===` that denies admins) yields `None`, so the
+/// guard cannot support a proof.
+///
+/// In a function returned by a factory, `!roles.includes(…)` where `roles` is the
+/// factory's rest parameter yields `["$args"]` (all call-site arguments) and its
+/// first parameter yields `["$arg0"]`; the model reads the literals at the call.
+fn admitted_roles(
+    f: &FnRef<'_, '_>,
+    params: &[String],
+    src: &Source<'_>,
+    consts: &HashMap<String, Vec<String>>,
+    factory: Option<&FactoryParams>,
+) -> Option<Vec<String>> {
+    let req = params.first()?.as_str();
+    let next = params.get(2)?.as_str();
+    let stmts = f.statements()?;
+    let is_role = |e: &Expression<'_>| {
+        let t = src.slice(inner(e).span()).split_whitespace().collect::<String>();
+        t.starts_with(&format!("{req}.")) && t.ends_with(".role")
+    };
+    // Roles admitted by an `if` test that denies when it holds, if recognised.
+    fn admitted<'a>(
+        test: &Expression<'a>,
+        is_role: &dyn Fn(&Expression<'a>) -> bool,
+        consts: &HashMap<String, Vec<String>>,
+        factory: Option<&FactoryParams>,
+    ) -> Option<Vec<String>> {
+        match inner(test) {
+            // !ROLES.includes(role)
+            Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => {
+                let Expression::CallExpression(c) = inner(&u.argument) else { return None };
+                let m = c.callee.get_inner_expression().as_member_expression()?;
+                if m.static_property_name() != Some("includes") || c.arguments.len() != 1 {
+                    return None;
+                }
+                let arg = c.arguments[0].as_expression()?;
+                if !is_role(arg) {
+                    return None;
+                }
+                if let Some(v) = string_array(m.object(), consts) {
+                    return Some(v);
+                }
+                let Expression::Identifier(id) = inner(m.object()) else { return None };
+                let fp = factory?;
+                if fp.rest.as_deref() == Some(id.name.as_str()) {
+                    Some(vec!["$args".to_owned()])
+                } else if fp.first.as_deref() == Some(id.name.as_str()) {
+                    Some(vec!["$arg0".to_owned()])
+                } else {
+                    None
+                }
+            }
+            // role !== 'a'
+            Expression::BinaryExpression(b) if b.operator == BinaryOperator::StrictInequality || b.operator == BinaryOperator::Inequality => {
+                let (role, lit) = if is_role(&b.left) { (&b.left, &b.right) } else { (&b.right, &b.left) };
+                if !is_role(role) {
+                    return None;
+                }
+                lit_str(inner(lit)).map(|s| vec![s.to_owned()])
+            }
+            // role !== 'a' && role !== 'b'  (denies unless role is a or b)
+            Expression::LogicalExpression(l) if l.operator == LogicalOperator::And => {
+                let (a, b) = (admitted(&l.left, is_role, consts, factory)?, admitted(&l.right, is_role, consts, factory)?);
+                if a.iter().chain(&b).any(|r| r.starts_with('$')) {
+                    return None;
+                }
+                Some(a.into_iter().chain(b).collect())
+            }
+            // A || B  (denies if either holds): passing needs every recognised
+            // disjunct false, so the roles are within each recognised set.
+            Expression::LogicalExpression(l) if l.operator == LogicalOperator::Or => {
+                match (admitted(&l.left, is_role, consts, factory), admitted(&l.right, is_role, consts, factory)) {
+                    (Some(a), Some(b)) => intersect(a, b),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    /// Roles in both sets; call-site placeholders (`$args`) only combine with
+    /// themselves, otherwise the result is unknown.
+    fn intersect(a: Vec<String>, b: Vec<String>) -> Option<Vec<String>> {
+        if a.iter().chain(&b).any(|r| r.starts_with('$')) {
+            return (a == b).then_some(a);
+        }
+        Some(a.into_iter().filter(|r| b.contains(r)).collect())
+    }
+    struct Exit<'n> {
+        next: &'n str,
+        /// `next()` without an error: lets the request through.
+        passes: bool,
+        /// Any call to `next`, with or without an error.
+        calls_next: bool,
+        denies: bool,
+    }
+    impl<'a> Visit<'a> for Exit<'_> {
+        fn visit_call_expression(&mut self, c: &CallExpression<'a>) {
+            if let Expression::Identifier(id) = c.callee.get_inner_expression()
+                && id.name.as_str() == self.next
+            {
+                self.calls_next = true;
+                if c.arguments.is_empty() { self.passes = true } else { self.denies = true }
+            }
+            if let Some(m) = c.callee.get_inner_expression().as_member_expression()
+                && matches!(m.static_property_name(), Some("status" | "sendStatus" | "code"))
+                && c.arguments.first().and_then(|a| a.as_expression()).is_some_and(|a| matches!(inner(a), Expression::NumericLiteral(n) if n.value >= 400.0))
+            {
+                self.denies = true;
+            }
+            walk::walk_call_expression(self, c);
+        }
+        fn visit_throw_statement(&mut self, t: &ThrowStatement<'a>) {
+            self.denies = true;
+            walk::walk_throw_statement(self, t);
+        }
+    }
+    let exits_denying = |s: &Statement<'_>| {
+        let last = match s {
+            Statement::BlockStatement(b) => b.body.last(),
+            other => Some(other),
+        };
+        if !matches!(last, Some(Statement::ReturnStatement(_) | Statement::ThrowStatement(_))) {
+            return false;
+        }
+        let mut e = Exit { next, passes: false, calls_next: false, denies: false };
+        e.visit_statement(s);
+        e.denies && !e.passes
+    };
+    let calls_next = |s: &Statement<'_>| {
+        let mut e = Exit { next, passes: false, calls_next: false, denies: false };
+        e.visit_statement(s);
+        e.calls_next
+    };
+    let mut result: Option<Vec<String>> = None;
+    for s in stmts {
+        if let Statement::IfStatement(i) = s
+            && i.alternate.is_none()
+            && exits_denying(&i.consequent)
+            && let Some(roles) = admitted(&i.test, &is_role, consts, factory)
+        {
+            result = match result {
+                None => Some(roles),
+                Some(prev) => Some(intersect(prev, roles)?),
+            };
+            continue;
+        }
+        if calls_next(s) {
+            break;
+        }
+    }
+    result.map(|mut v| {
+        v.sort();
+        v.dedup();
+        v
+    })
+}
+
 fn request_overrides(stmts: &[Statement<'_>], req: &str, src: &Source<'_>) -> Vec<String> {
     struct O<'q, 'c, 's> {
         req: &'q str,
@@ -921,6 +1167,7 @@ pub struct ModuleOut {
 }
 
 struct P2<'c, 's> {
+    string_arrays: &'c HashMap<String, Vec<String>>,
     src: &'c Source<'s>,
     p1: &'c Pass1,
     comments: &'c [Comment],
@@ -947,6 +1194,8 @@ impl P2<'_, '_> {
         let annotations = annotations(self.comments, self.src, meta.stmt_start);
         let request_overrides = f.statements().map(|st| request_overrides(st, params.first().map_or("req", String::as_str), self.src)).unwrap_or_default();
         let guard = guard_fact(&f, &params, self.src);
+        let factory = self.p1.factory_params.get(&span.start);
+        let admits_roles = guard.and_then(|_| admitted_roles(&f, &params, self.src, self.string_arrays, factory));
         self.functions.push(FunctionFact {
             name: meta.name.clone(),
             params: params.clone(),
@@ -957,6 +1206,7 @@ impl P2<'_, '_> {
             annotations: annotations.clone(),
             request_overrides,
             guard,
+            admits_roles,
         });
 
         let stmts = f.statements();
@@ -1112,8 +1362,10 @@ pub fn resolve_import(from_file: &str, spec: &str, known: &HashSet<String>) -> O
 pub fn analyze_program(program: &Program<'_>, src: &Source<'_>, known_files: &HashSet<String>) -> ModuleFacts {
     let mut p1 = P1 { src, st: Pass1::default(), stmt_start: 0 };
     p1.visit_program(program);
+    let string_arrays = top_level_string_arrays(&program.body);
     let st = p1.st;
     let mut p2 = P2 {
+        string_arrays: &string_arrays,
         src,
         p1: &st,
         comments: program.comments.as_slice(),

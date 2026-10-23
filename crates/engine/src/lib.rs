@@ -11,6 +11,7 @@ pub mod external;
 pub mod pipeline;
 pub mod reachable;
 pub mod report;
+pub mod runtime;
 pub mod secrets;
 pub mod selftest;
 pub mod verdict;

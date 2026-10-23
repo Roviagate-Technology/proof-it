@@ -256,6 +256,10 @@ pub fn run(opts: &Options) -> Result<Report> {
         fs.extend(crate::appchecks::app_config(&root, &facts));
         stages.push(StageRun::new("app-config", StageStatus::Ran, ms(t), format!("{} finding(s)", fs.len())));
         findings.extend(fs);
+        let t = Instant::now();
+        let fs = crate::runtime::scan(&root, &project.text_files);
+        stages.push(StageRun::new("node-runtime", StageStatus::Ran, ms(t), format!("{} finding(s)", fs.len())));
+        findings.extend(fs);
     }
     if opts.stages.contains(&Stage::Secrets) && config.analysis.secrets {
         let t = Instant::now();

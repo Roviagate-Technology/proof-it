@@ -39,6 +39,7 @@ pub fn known_rules(reg: &Registry) -> Vec<String> {
     v.extend(crate::secrets::rule_ids().into_iter().map(str::to_owned));
     v.push(crate::datafiles::RULE_ID.to_owned());
     v.extend(crate::appchecks::RULE_IDS.iter().map(|s| (*s).to_owned()));
+    v.extend(crate::runtime::RULE_IDS.iter().map(|s| (*s).to_owned()));
     v.extend(reg.properties.keys().cloned());
     v.extend(["osv:", "gitleaks:", "semgrep:"].iter().map(|s| (*s).to_owned()));
     v

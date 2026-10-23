@@ -76,6 +76,17 @@ const SKIP_DIRS: [&str; 22] = [
 pub const DATA_EXTS: [&str; 17] =
     ["csv", "tsv", "jsonl", "ndjson", "sql", "dump", "bak", "backup", "sqlite", "sqlite3", "db", "xlsx", "xls", "parquet", "json", "txt", "log"];
 
+/// Files that pin a runtime version (container images, version-manager files),
+/// read by the runtime advisory check.
+fn is_runtime_pin_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "dockerfile"
+        || lower.starts_with("dockerfile.")
+        || lower.ends_with(".dockerfile")
+        || lower == "containerfile"
+        || matches!(lower.as_str(), ".nvmrc" | ".node-version" | ".tool-versions")
+}
+
 const TEXT_EXTS: [&str; 31] = [
     "json",
     "yml",
@@ -215,7 +226,7 @@ fn walk(root: &Path, dir: &Path, excludes: &[Regex], wanted: &[String], p: &mut 
                     p.text_files.push(abs);
                 }
             }
-            None if TEXT_EXTS.contains(&ext.as_str()) || name.starts_with(".env") || name == "Dockerfile" => p.text_files.push(abs),
+            None if TEXT_EXTS.contains(&ext.as_str()) || name.starts_with(".env") || is_runtime_pin_file(&name) => p.text_files.push(abs),
             None => {}
         }
     }

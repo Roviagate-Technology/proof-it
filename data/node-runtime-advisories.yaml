@@ -1,0 +1,43 @@
+# Node.js runtime security releases, used by the INFRA-003 check.
+#
+# A dependency scanner reads lockfiles; the Node.js runtime itself is never in
+# a lockfile, so a project running an unpatched or end-of-life Node.js passes
+# INFRA-001 untouched. This table closes that gap.
+#
+# Maintenance: when Node.js publishes a security release, append an entry with
+# the fixed version for every line it patches, and update `supported` when a
+# line reaches end of life. Every pin older than `fixed` on its line is then
+# reported; nothing in the code needs to change. Only add data verified against
+# https://nodejs.org/en/blog/vulnerability and https://github.com/nodejs/Release.
+
+updated: 2026-10-22
+
+# Release lines receiving security fixes as of `updated`. Any other line at or
+# below the newest supported one is end of life: affected by every later
+# security release, with no fix.
+supported: [22, 24, 26]
+
+releases:
+  - id: october-2026
+    date: 2026-10-21
+    severity: high
+    url: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+    summary: >-
+      Brotli decoder out-of-bounds write that can permit remote code execution
+      (CVE-2026-111497), TLS hostname verification bypasses, dns.resolve NUL
+      truncation, and 7 more.
+    cves:
+      - CVE-2026-111497
+      - CVE-2026-106069
+      - CVE-2026-105483
+      - CVE-2026-105482
+      - CVE-2026-105481
+      - CVE-2026-106072
+      - CVE-2026-106074
+      - CVE-2026-106073
+      - CVE-2026-106070
+      - CVE-2026-106071
+    fixed:
+      "22": 22.23.4
+      "24": 24.22.1
+      "26": 26.12.1

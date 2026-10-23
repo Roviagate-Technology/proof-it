@@ -1,0 +1,24 @@
+id: INFRA-003
+name: Runtime is a supported, patched Node.js release
+category: infrastructure
+severity: high
+version: 1
+description: >-
+  Every place the project pins Node.js (container images, .nvmrc,
+  .node-version, .tool-versions, package.json engines and volta, CI
+  node-version) names a supported release line at or above its latest
+  security fix.
+rationale: >-
+  The runtime is not in any lockfile, so dependency scanning never sees it. An
+  end-of-life or unpatched Node.js exposes every service built on it.
+languages:
+- typescript
+- javascript
+signals:
+- .
+detectors:
+- node-runtime:*
+assumptions:
+- Judges the versions the files pin, not what is deployed; a floating tag is as patched as its last build.
+- Limited to the security releases listed in data/node-runtime-advisories.yaml at build time.
+recommendation: Pin a supported Node.js release at or above the latest security fix, rebuild and redeploy.

@@ -273,6 +273,10 @@ pub struct FunctionFact {
     /// For `(req, res, next)` middleware: what its body can actually do.
     #[serde(default)]
     pub guard: Option<GuardFact>,
+    /// For middleware: the exact set of roles it lets through, when that can be
+    /// read from the code (see `lang-ts` `admitted_roles`); `None` when it cannot.
+    #[serde(default)]
+    pub admits_roles: Option<Vec<String>>,
 }
 
 /// What a middleware body does, read from its code (not its name).

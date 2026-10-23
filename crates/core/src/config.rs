@@ -375,9 +375,32 @@ pub struct OrgPolicy {
     pub merge_policy: MergePolicy,
     /// Organisation-wide state-machine specifications (override the repository's).
     pub state_machines: Vec<StateMachineSpec>,
+    /// Roles that count as administrators for AUTHZ-002 (default: admin,
+    /// super_admin, superadmin). Only this trusted file can add a role: the
+    /// repository's `authorization.admin_roles` may only narrow the set.
+    pub admin_roles: Option<Vec<String>>,
     /// Where this policy was loaded from (always overwritten by the loader).
     #[serde(default)]
     pub source: Option<String>,
+}
+
+/// The admin roles AUTHZ-002 proves against, and the repository's list when it
+/// was ignored.
+///
+/// The repository configuration is untrusted: a role it adds would let an
+/// agent or attacker "prove" that a non-admin role is an admin (configure
+/// `user` as an admin role and every role check passes). The trusted set comes
+/// from the organisation policy, else the built-in default; the repository may
+/// narrow it (a smaller set only makes proofs harder) but never widen it.
+pub fn effective_admin_roles(config: &Config, org: &OrgPolicy) -> (Vec<String>, Option<Vec<String>>) {
+    let default = AuthorizationSection::default().admin_roles;
+    let trusted = org.admin_roles.clone().unwrap_or_else(|| default.clone());
+    let repo = &config.authorization.admin_roles;
+    // Left at the default: the repository did not set it.
+    if *repo == default {
+        return (trusted, None);
+    }
+    if !repo.is_empty() && repo.iter().all(|r| trusted.contains(r)) { (repo.clone(), None) } else { (trusted, Some(repo.clone())) }
 }
 
 /// Load the organisation policy from (in order) an explicit path, `$PROOF_IT_POLICY`,
@@ -518,5 +541,47 @@ mod tests {
         std::fs::create_dir(dir.path().join(".proof-it")).expect("mkdir");
         std::fs::write(dir.path().join(".proof-it/suppressions.yaml"), "suppressions:\n  - finding: SEC-SQLI\n    reason: ok\n").expect("write");
         assert!(load_suppressions(dir.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admin_role_trust {
+    use super::*;
+
+    fn cfg(roles: &[&str]) -> Config {
+        let mut c = Config::default();
+        c.authorization.admin_roles = roles.iter().map(|r| (*r).to_owned()).collect();
+        c
+    }
+    fn org(roles: Option<&[&str]>) -> OrgPolicy {
+        OrgPolicy { admin_roles: roles.map(|r| r.iter().map(|x| (*x).to_owned()).collect()), ..OrgPolicy::default() }
+    }
+    fn set(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    #[test]
+    fn repository_cannot_add_admin_roles() {
+        // An agent declaring every role an admin: ignored, reported.
+        let (roles, ignored) = effective_admin_roles(&cfg(&["admin", "user"]), &org(None));
+        assert_eq!(roles, set(&["admin", "super_admin", "superadmin"]));
+        assert_eq!(ignored, Some(set(&["admin", "user"])));
+        // Even a role the organisation might accept, unless the organisation says so.
+        let (roles, ignored) = effective_admin_roles(&cfg(&["admin", "organization_admin"]), &org(None));
+        assert!(!roles.contains(&"organization_admin".to_owned()));
+        assert!(ignored.is_some());
+        // An empty list would make every admin check vacuous.
+        assert!(effective_admin_roles(&cfg(&[]), &org(None)).1.is_some());
+    }
+
+    #[test]
+    fn repository_may_narrow_and_organisation_decides() {
+        assert_eq!(effective_admin_roles(&cfg(&["super_admin"]), &org(None)), (set(&["super_admin"]), None));
+        let o = org(Some(&["admin", "super_admin", "organization_admin"]));
+        // Repository left at the default: the organisation's set applies, no warning.
+        assert_eq!(effective_admin_roles(&Config::default(), &o), (set(&["admin", "super_admin", "organization_admin"]), None));
+        // The organisation's set can be narrowed by the repository, not widened.
+        assert_eq!(effective_admin_roles(&cfg(&["organization_admin"]), &o), (set(&["organization_admin"]), None));
+        assert!(effective_admin_roles(&cfg(&["organization_admin", "user"]), &o).1.is_some());
     }
 }

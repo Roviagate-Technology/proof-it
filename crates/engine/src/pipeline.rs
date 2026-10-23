@@ -472,6 +472,17 @@ pub fn run(opts: &Options) -> Result<Report> {
             verdict.verdict = AssuranceVerdict::PassedWithWarnings;
         }
     }
+    // The repository may not redefine who is an administrator (see effective_admin_roles).
+    if let (roles, Some(ignored)) = proof_it_core::config::effective_admin_roles(&config, &org) {
+        verdict.warnings.push(format!(
+            "authorization.admin_roles in the repository configuration ({}) was ignored: it would add roles to the trusted admin set ({}). Set admin roles in the organisation policy.",
+            if ignored.is_empty() { "empty".to_owned() } else { ignored.join(", ") },
+            roles.join(", ")
+        ));
+        if verdict.verdict == AssuranceVerdict::Passed {
+            verdict.verdict = AssuranceVerdict::PassedWithWarnings;
+        }
+    }
     if let Some(c) = &change_assessment {
         for g in &c.regressions {
             verdict.reasons.push(format!("REGRESSION {} {}: {} → {}", g.property_id, g.target, g.before, g.after));

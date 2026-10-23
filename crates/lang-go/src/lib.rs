@@ -124,6 +124,7 @@ fn functions(src: &Src<'_>, root: Node<'_>) -> Vec<FunctionFact> {
                 annotations: vec![],
                 request_overrides: vec![],
                 guard: None,
+                admits_roles: None,
             });
         }
     }

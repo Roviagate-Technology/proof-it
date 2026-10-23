@@ -26,6 +26,16 @@ cases:
   - { dir: security/path-traversal-bad, finding: SEC-PATH-TRAVERSAL }
   - { dir: security/jwt-expiry-bad, finding: SEC-JWT-IGNORE-EXPIRATION }
   - { dir: security/secret-bad, finding: SECRET-STRIPE-KEY }
+
+  - { dir: security/cmdi-good, no_finding: SEC-CMDI }
+
+  - { dir: security/ssrf-good, no_finding: SEC-SSRF }
+
+  - { dir: security/path-traversal-good, no_finding: SEC-PATH-TRAVERSAL }
+
+  - { dir: security/jwt-expiry-good, no_finding: SEC-JWT-IGNORE-EXPIRATION }
+
+  - { dir: security/secret-good, no_finding: SECRET-STRIPE-KEY }
   - { dir: state-machines/table-good, property: STATE-002, target: "OrderStatus:SHIPPED->PENDING", status: PROVEN }
   - { dir: authz/validation-and-owner-good, property: AUTHZ-001, status: PROVEN }
   - { dir: authz/role-list-good, property: AUTHZ-002, status: PROVEN }

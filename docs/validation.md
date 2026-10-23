@@ -4,7 +4,7 @@ All numbers below are reproducible from this repository.
 
 ## 1. Benchmarks (`benchmarks/`, `cargo test -p proof-it --test benchmarks`)
 
-44 cases, each a minimal correct or broken implementation with the expected
+49 cases, each a minimal correct or broken implementation with the expected
 status or finding: IDOR (unguarded, projection leak, missing `return`, scoped
 query, tenant scoping, try/catch, swallowed throw, handler factory, trusted vs
 header-copied identity), write IDOR, admin authorization (role checks, role
